@@ -12,23 +12,39 @@ import (
 	"github.com/xTwo56/iris/internal/delivery"
 )
 
+// ErrDuplicateAttemptID indicates a start already exists with this identity.
 var ErrDuplicateAttemptID = errors.New("attempt ID already exists")
 
+// ErrDuplicateOutcome indicates an observation already exists for this attempt.
 var ErrDuplicateOutcome = errors.New("attempt outcome already exists")
 
+// ErrAttemptStartNotFound indicates an outcome references a missing start.
 var ErrAttemptStartNotFound = errors.New("attempt start not found")
 
+// ErrAttemptNotFound indicates no start matched a history lookup.
 var ErrAttemptNotFound = errors.New("attempt not found")
 
+// AttemptHistory combines a start with its optional observation. Outcome is nil
+// when the result is unknown, not when delivery is confirmed to have failed.
+// The values are reconstructed domain records, independent of database buffers.
 type AttemptHistory struct {
 	Start   delivery.AttemptStart
 	Outcome *delivery.AttemptOutcome
 }
 
+// AttemptRepository appends and reads history using a caller-owned pool or
+// transaction. It never commits, rolls back or closes the caller's resources.
+// Future workers must durably save the start before sending HTTP and append the
+// outcome afterward; never hold one database transaction across the network call.
+// Append-only use assumes starts remain immutable; this API exposes no mutations.
 type AttemptRepository struct{ db RunQueries }
 
+// NewAttemptRepository reuses the narrow delivery query surface, including Query
+// for lists, without opening connections or applying migrations.
 func NewAttemptRepository(db RunQueries) *AttemptRepository { return &AttemptRepository{db: db} }
 
+// AppendStart validates before insertion. SQLSTATE and named constraints map
+// duplicate identities and missing runs; other errors preserve their cause.
 func (r *AttemptRepository) AppendStart(ctx context.Context, s delivery.AttemptStart) error {
 	if _, err := delivery.NewAttemptStart(s.ID(), s.RunID(), s.StartedAt()); err != nil {
 		return fmt.Errorf("append attempt start: validate: %w", err)
@@ -49,6 +65,10 @@ func (r *AttemptRepository) AppendStart(ctx context.Context, s delivery.AttemptS
 	return nil
 }
 
+// AppendOutcome loads the actual persisted start and reconstructs the outcome
+// against it before inserting. A caller's earlier start time cannot bypass this
+// validation. Nullable status is passed separately from its value, preserving
+// absence. The primary key enforces one observation even for concurrent inserts.
 func (r *AttemptRepository) AppendOutcome(ctx context.Context, o delivery.AttemptOutcome) error {
 	if strings.TrimSpace(string(o.AttemptID())) == "" || o.FinishedAt().IsZero() {
 		return errors.New("append attempt outcome: invalid identity or zero finish timestamp")
@@ -93,6 +113,8 @@ func (r *AttemptRepository) AppendOutcome(ctx context.Context, o delivery.Attemp
 const attemptSelect = `SELECT s.id,s.run_id,s.started_at,o.attempt_id,o.finished_at,o.http_status,o.classification
  FROM attempt_starts s LEFT JOIN attempt_outcomes o ON o.attempt_id=s.id `
 
+// scanAttempt validates both stored records. The joined outcome ID, not status,
+// determines presence: an outcome with NULL status is still a complete record.
 func scanAttempt(row interface{ Scan(...any) error }) (AttemptHistory, error) {
 	var id, runID string
 	var at time.Time
@@ -120,6 +142,8 @@ func scanAttempt(row interface{ Scan(...any) error }) (AttemptHistory, error) {
 	return result, nil
 }
 
+// GetByID uses one left join to observe a start and optional outcome together.
+// Missing outcomes are valid history; only a missing start maps to ErrAttemptNotFound.
 func (r *AttemptRepository) GetByID(ctx context.Context, id delivery.AttemptID) (AttemptHistory, error) {
 	h, err := scanAttempt(r.db.QueryRow(ctx, attemptSelect+`WHERE s.id=$1`, string(id)))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -131,6 +155,9 @@ func (r *AttemptRepository) GetByID(ctx context.Context, id delivery.AttemptID) 
 	return h, nil
 }
 
+// ListByRunID includes unknown outcomes and orders by start time then bytewise
+// attempt ID. Rows close on every path, and iteration errors discard partial
+// results. No matching starts returns an empty slice, including for absent runs.
 func (r *AttemptRepository) ListByRunID(ctx context.Context, id delivery.RunID) ([]AttemptHistory, error) {
 	rows, err := r.db.Query(ctx, attemptSelect+`WHERE s.run_id=$1 ORDER BY s.started_at,s.id COLLATE "C"`, string(id))
 	if err != nil {
