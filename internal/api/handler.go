@@ -22,7 +22,6 @@ import (
 // Endpoints and Subscriptions accept request contexts and leave connection
 // ownership with the bootstrap caller. Existing PostgreSQL repositories satisfy them.
 type Endpoints interface {
-	Create(context.Context, endpoint.Endpoint) error
 	GetByID(context.Context, endpoint.ID) (endpoint.Endpoint, error)
 	SetFanout(context.Context, endpoint.ID, bool) error
 }
@@ -32,13 +31,20 @@ type Subscriptions interface {
 	SetEnabled(context.Context, subscription.ID, bool) error
 }
 
+// EndpointCreator atomically creates the endpoint and encrypted secret. Its return
+// value is only exposed by the authenticated creation response.
+type EndpointCreator interface {
+	Create(context.Context, endpoint.Endpoint) (string, error)
+}
+
 // Dependencies supplies storage and application-generated metadata for testability.
 type Dependencies struct {
-	Endpoints      Endpoints
-	Subscriptions  Subscriptions
-	EndpointID     func() (endpoint.ID, error)
-	SubscriptionID func() (subscription.ID, error)
-	Now            func() time.Time
+	EndpointCreator EndpointCreator
+	Endpoints       Endpoints
+	Subscriptions   Subscriptions
+	EndpointID      func() (endpoint.ID, error)
+	SubscriptionID  func() (subscription.ID, error)
+	Now             func() time.Time
 }
 
 // New protects every route before decoding or database access. The management
@@ -48,7 +54,7 @@ func New(token string, d Dependencies) (http.Handler, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, errors.New("management token is required")
 	}
-	if d.Endpoints == nil || d.Subscriptions == nil || d.EndpointID == nil || d.SubscriptionID == nil || d.Now == nil {
+	if d.EndpointCreator == nil || d.Endpoints == nil || d.Subscriptions == nil || d.EndpointID == nil || d.SubscriptionID == nil || d.Now == nil {
 		return nil, errors.New("missing API dependency")
 	}
 	mux := http.NewServeMux()
@@ -161,11 +167,20 @@ func (d Dependencies) createEndpoint(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "invalid_input", "invalid endpoint URL")
 		return
 	}
-	if err := d.Endpoints.Create(r.Context(), e); err != nil {
+	secret, err := d.EndpointCreator.Create(r.Context(), e)
+	if err != nil {
 		storageError(w, err)
 		return
 	}
-	write(w, 201, endpointJSON(e))
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	write(w, 201, struct {
+		ID            endpoint.ID `json:"id"`
+		URL           string      `json:"url"`
+		CreatedAt     time.Time   `json:"created_at"`
+		Fanout        bool        `json:"fanout"`
+		SigningSecret string      `json:"signing_secret"`
+	}{e.ID(), e.URL(), e.CreatedAt(), e.Fanout(), secret})
 }
 func (d Dependencies) getEndpoint(w http.ResponseWriter, r *http.Request) {
 	e, err := d.Endpoints.GetByID(r.Context(), endpoint.ID(r.PathValue("id")))

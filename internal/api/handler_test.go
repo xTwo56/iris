@@ -22,13 +22,13 @@ type endpoints struct {
 	ctx context.Context
 }
 
-func (s *endpoints) Create(ctx context.Context, e endpoint.Endpoint) error {
+func (s *endpoints) Create(ctx context.Context, e endpoint.Endpoint) (string, error) {
 	s.ctx = ctx
 	if s.err != nil {
-		return s.err
+		return "", s.err
 	}
 	s.e = e
-	return nil
+	return "creation-secret", nil
 }
 func (s *endpoints) GetByID(ctx context.Context, id endpoint.ID) (endpoint.Endpoint, error) {
 	s.ctx = ctx
@@ -87,7 +87,7 @@ func (s *subscriptions) SetEnabled(ctx context.Context, id subscription.ID, v bo
 func setup(t *testing.T) (http.Handler, *endpoints, *subscriptions) {
 	t.Helper()
 	e, s := &endpoints{}, &subscriptions{}
-	h, err := api.New("secret", api.Dependencies{Endpoints: e, Subscriptions: s, EndpointID: func() (endpoint.ID, error) { return "ep", nil }, SubscriptionID: func() (subscription.ID, error) { return "sub", nil }, Now: func() time.Time { return time.Date(2026, 9, 19, 0, 0, 0, 123456789, time.UTC) }})
+	h, err := api.New("secret", api.Dependencies{EndpointCreator: e, Endpoints: e, Subscriptions: s, EndpointID: func() (endpoint.ID, error) { return "ep", nil }, SubscriptionID: func() (subscription.ID, error) { return "sub", nil }, Now: func() time.Time { return time.Date(2026, 9, 19, 0, 0, 0, 123456789, time.UTC) }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,5 +180,27 @@ func TestStorageErrors(t *testing.T) {
 		if w := request(h, tt.m, tt.p, tt.b, "Bearer secret"); w.Code != 404 {
 			t.Fatal(w.Code)
 		}
+	}
+}
+
+func TestCreationSecretOnly(t *testing.T) {
+	h, _, _ := setup(t)
+	w := request(h, "POST", "/v1/endpoints", `{"url":"https://example.com"}`, "Bearer secret")
+	if w.Code != 201 || w.Header().Get("Cache-Control") != "no-store" || !strings.Contains(w.Body.String(), `"signing_secret":"creation-secret"`) {
+		t.Fatalf("bad creation %d %s", w.Code, w.Body)
+	}
+	for _, method := range []string{"GET", "PATCH"} {
+		body := ""
+		if method == "PATCH" {
+			body = `{"fanout":false}`
+		}
+		w = request(h, method, "/v1/endpoints/ep", body, "Bearer secret")
+		if w.Code != 200 || strings.Contains(w.Body.String(), "secret") {
+			t.Fatalf("secret exposed on %s: %s", method, w.Body)
+		}
+	}
+	w = request(h, "POST", "/v1/endpoints", `{"url":"https://example.com"}`, "")
+	if strings.Contains(w.Body.String(), "creation-secret") {
+		t.Fatal("unauthenticated disclosure")
 	}
 }

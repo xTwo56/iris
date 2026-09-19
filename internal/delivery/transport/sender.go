@@ -18,6 +18,7 @@ import (
 
 	"github.com/xTwo56/iris/internal/delivery"
 	"github.com/xTwo56/iris/internal/event"
+	"github.com/xTwo56/iris/internal/webhook/signing"
 )
 
 const (
@@ -79,6 +80,9 @@ func New(config Config) (*Sender, error) {
 // amount of response data. One deadline spans DNS, TCP, TLS, headers and body.
 // No redirects, environment proxies, application retries or signing are involved.
 func (s *Sender) Send(caller context.Context, destination string, payload []byte, eventID event.ID, deliveryID delivery.ID) Observation {
+	return s.send(caller, destination, payload, eventID, deliveryID, nil)
+}
+func (s *Sender) send(caller context.Context, destination string, payload []byte, eventID event.ID, deliveryID delivery.ID, signed *signing.Headers) Observation {
 	if caller.Err() != nil {
 		return failed(caller.Err(), false)
 	}
@@ -86,7 +90,7 @@ func (s *Sender) Send(caller context.Context, destination string, payload []byte
 	if err != nil {
 		return failed(err, true)
 	}
-	if !validHeaderID(string(eventID)) || !validHeaderID(string(deliveryID)) {
+	if signed == nil && (!validHeaderID(string(eventID)) || !validHeaderID(string(deliveryID))) {
 		return failed(ErrInvalidIdentity, true)
 	}
 	ctx, cancel := context.WithTimeout(caller, s.config.Timeout)
@@ -111,6 +115,12 @@ func (s *Sender) Send(caller context.Context, destination string, payload []byte
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(EventIDHeader, string(eventID))
 	req.Header.Set(DeliveryIDHeader, string(deliveryID))
+	if signed != nil {
+		req.Header.Set(EventIDHeader, signed.EventID)
+		req.Header.Set(DeliveryIDHeader, signed.DeliveryID)
+		req.Header.Set(signing.TimestampHeader, signed.Timestamp)
+		req.Header.Set(signing.SignatureHeader, signed.Signature)
+	}
 	response, err := client.Do(req)
 	if err != nil {
 		if response != nil {

@@ -1,9 +1,12 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/base64"
 	"errors"
+	"github.com/xTwo56/iris/internal/webhook/signing"
 	"io"
 	"net"
 	"net/http"
@@ -249,5 +252,56 @@ func TestApprovedAddressesOnly(t *testing.T) {
 	_, err := s.dialPublic(context.Background(), "tcp", "example.com:8443")
 	if err != ErrNetwork || len(targets) != 2 || targets[0] != "8.8.8.8:8443" || targets[1] != "[2606:4700:4700::1111]:8443" {
 		t.Fatalf("%v %v", targets, err)
+	}
+}
+
+func TestSignedBytesOnWire(t *testing.T) {
+	secret := bytes.Repeat([]byte{7}, 32)
+	payload := []byte(" {\"n\":1.00}\n")
+	at := time.Unix(1700000000, 0)
+	var requests atomic.Int32
+	s, url, _ := testSender(t, func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		body, err := io.ReadAll(r.Body)
+		if err != nil || !bytes.Equal(body, payload) {
+			t.Error("signed body differs")
+		}
+		h := signing.Headers{Timestamp: r.Header.Get(signing.TimestampHeader), Signature: r.Header.Get(signing.SignatureHeader), EventID: r.Header.Get(EventIDHeader), DeliveryID: r.Header.Get(DeliveryIDHeader)}
+		if err := signing.Verify(secret, body, h, at, time.Minute); err != nil {
+			t.Errorf("wire signature: %v", err)
+		}
+		e, _ := base64.RawURLEncoding.DecodeString(h.EventID)
+		d, _ := base64.RawURLEncoding.DecodeString(h.DeliveryID)
+		if string(e) != " event|\nα " || string(d) != "delivery:\r\nβ" {
+			t.Error("IDs not preserved")
+		}
+		w.WriteHeader(204)
+	})
+	var ticks atomic.Int64
+	signed, err := NewSigned(s, func() time.Time { return at.Add(time.Duration(ticks.Add(1)) * time.Second) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		o := signed.Send(context.Background(), url, payload, " event|\nα ", "delivery:\r\nβ", secret)
+		if o.HTTPStatus != 204 {
+			t.Fatal(o)
+		}
+	}
+	if ticks.Load() != 2 || requests.Load() != 2 {
+		t.Fatal("clock not refreshed")
+	}
+	for _, bad := range [][]byte{nil, make([]byte, 31)} {
+		o := signed.Send(context.Background(), url, payload, "e", "d", bad)
+		if o.Err != signing.ErrInvalid || o.HTTPStatus != 0 {
+			t.Fatal(o)
+		}
+	}
+	if requests.Load() != 2 {
+		t.Fatal("missing credentials sent a request")
+	}
+	o := signed.Send(context.Background(), "https://127.0.0.1/", payload, "e", "d", secret)
+	if o.Err != ErrBlockedDestination {
+		t.Fatal("signing bypassed SSRF")
 	}
 }

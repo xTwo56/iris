@@ -16,13 +16,18 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/xTwo56/iris/internal/api"
+	"github.com/xTwo56/iris/internal/application/endpointcreation"
 	"github.com/xTwo56/iris/internal/endpoint"
 	endpointpg "github.com/xTwo56/iris/internal/endpoint/postgres"
+	"github.com/xTwo56/iris/internal/endpointsecret"
 	"github.com/xTwo56/iris/internal/subscription"
 	subscriptionpg "github.com/xTwo56/iris/internal/subscription/postgres"
 )
 
-type config struct{ token, databaseURL, address string }
+type config struct {
+	token, databaseURL, address string
+	encryptionKey               []byte
+}
 
 // loadConfig rejects missing authentication before opening a database or listener.
 // Configuration errors never contain credentials or connection strings.
@@ -37,6 +42,11 @@ func loadConfig(getenv func(string) string) (config, error) {
 	if strings.TrimSpace(c.databaseURL) == "" {
 		return config{}, errors.New("IRIS_DATABASE_URL is required")
 	}
+	key, err := endpointsecret.ParseKey(getenv("IRIS_SECRET_ENCRYPTION_KEY"))
+	if err != nil {
+		return config{}, errors.New("IRIS_SECRET_ENCRYPTION_KEY must be canonical base64 of 32 bytes")
+	}
+	c.encryptionKey = key
 	if c.address == "" {
 		c.address = "127.0.0.1:8080"
 	}
@@ -77,7 +87,12 @@ func run() error {
 	if err := pool.Ping(startup); err != nil {
 		return errors.New("database connection failed")
 	}
-	handler, err := api.New(c.token, api.Dependencies{Endpoints: endpointpg.New(pool), Subscriptions: subscriptionpg.New(pool), EndpointID: func() (endpoint.ID, error) { id, err := newID("ep_"); return endpoint.ID(id), err }, SubscriptionID: func() (subscription.ID, error) { id, err := newID("sub_"); return subscription.ID(id), err }, Now: time.Now})
+	cipher, err := endpointsecret.New(c.encryptionKey)
+	clear(c.encryptionKey)
+	if err != nil {
+		return errors.New("secret encryption configuration failed")
+	}
+	handler, err := api.New(c.token, api.Dependencies{EndpointCreator: endpointcreation.New(pool, cipher), Endpoints: endpointpg.New(pool), Subscriptions: subscriptionpg.New(pool), EndpointID: func() (endpoint.ID, error) { id, err := newID("ep_"); return endpoint.ID(id), err }, SubscriptionID: func() (subscription.ID, error) { id, err := newID("sub_"); return subscription.ID(id), err }, Now: time.Now})
 	if err != nil {
 		return errors.New("API configuration failed")
 	}
