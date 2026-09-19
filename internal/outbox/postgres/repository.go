@@ -139,3 +139,37 @@ func (r *Repository) MarkSubmitted(ctx context.Context, id delivery.RunID, job s
 	}
 	return nil
 }
+
+// ListPendingAfter walks pending intent without reserving it. The exclusive
+// timestamp/ID cursor lets dispatchers move past failed entries; callers wrap to
+// the beginning after an empty page. Concurrent acknowledgments only remove rows.
+func (r *Repository) ListPendingAfter(ctx context.Context, limit int, after time.Time, id delivery.RunID) ([]outbox.Entry, error) {
+	if limit <= 0 || limit > MaxPendingLimit {
+		return nil, fmt.Errorf("list pending outbox: limit must be 1–%d", MaxPendingLimit)
+	}
+	rows, err := r.db.Query(ctx, `SELECT run_id,submission_key,created_at,mercury_job_id,submitted_at FROM outbox
+ WHERE mercury_job_id IS NULL AND ($2::timestamptz IS NULL OR created_at > $2 OR (created_at=$2 AND run_id COLLATE "C" > $3 COLLATE "C"))
+ ORDER BY created_at,run_id COLLATE "C" LIMIT $1`, limit, optionalCursorTime(after), string(id))
+	if err != nil {
+		return nil, fmt.Errorf("page pending outbox: %w", err)
+	}
+	defer rows.Close()
+	entries := make([]outbox.Entry, 0)
+	for rows.Next() {
+		e, err := scanEntry(rows)
+		if err != nil {
+			return nil, fmt.Errorf("page pending outbox: reconstruct: %w", err)
+		}
+		entries = append(entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("page pending outbox: iterate: %w", err)
+	}
+	return entries, nil
+}
+func optionalCursorTime(at time.Time) any {
+	if at.IsZero() {
+		return nil
+	}
+	return at
+}

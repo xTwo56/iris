@@ -1,0 +1,154 @@
+# Outbox dispatcher
+
+The dispatcher reads pending intent, resolves its delivery run and delivery,
+submits a Mercury job, then records the acknowledged job ID. It never sends a
+webhook. Start it separately from the unchanged management API:
+
+```sh
+export IRIS_DATABASE_URL='postgres://.../iris'
+export IRIS_MERCURY_URL='https://mercury.example'
+export IRIS_MERCURY_SUBMISSION_TOKEN='<producer or gateway bearer credential>'
+go run ./cmd/iris-dispatcher
+```
+
+Apply existing Iris migrations separately; this change needs no new migration.
+The dispatcher does not need the API management token or secret encryption key.
+SIGINT/SIGTERM cancels requests, polling and database operations before closing
+its HTTP client and database pool.
+
+**The Mercury build inspected for this change cannot yet accept these jobs.**
+Its submission validator registers only `sleep`, so `webhook.deliver.v1` receives
+400 `unsupported_task_type`. Also, `POST /v1/jobs` currently has no bearer
+authentication. `MERCURY_WORKER_BEARER_TOKEN` protects only `/v1/worker/...`, not
+submission. Iris sends the required configured producer credential, but sending
+that header alone does not establish authenticated submission. Use an explicitly
+configured authenticated submission gateway, or separately add producer auth to
+Mercury, and provision acceptance of the generic task contract before operating
+this dispatcher. No Mercury code or deployment infrastructure was changed here.
+The dispatcher retains rejected intent and reports configuration/authentication
+errors; it does not switch task types or generate replacement keys.
+
+## Verified submission contract
+
+No public Mercury submission client exists in the inspected repository. Iris's
+narrow adapter follows its actual `internal/httpapi/handler.go`,
+`internal/app/jobs.go`, `internal/app/idempotency.go`, PostgreSQL repository and
+`000003_add_job_idempotency.up.sql`:
+
+* `POST /v1/jobs`, `Content-Type: application/json`, `Idempotency-Key` header.
+  Keys must be 1–255 printable ASCII bytes with no whitespace. Existing Iris
+  acceptance produces `iris:delivery-run:<run-id>` once and stores it. Invalid
+  legacy keys are rejected for investigation, never normalized or replaced.
+* Request: `{"task_type":"webhook.deliver.v1","payload":{"delivery_id":"…","run_id":"…"},"max_attempts":3}`.
+  The `.v1` task name versions the payload contract. The payload has exactly the
+  two references, with no copied event body, URL, secret or current timestamp.
+* The explicit execution-attempt budget is **fixed at three for v1**. Always omit
+  `available_at`. Neither is a polling configuration option. Thus a fresh process
+  recreates the same request from immutable database references without extra
+  submission metadata. Do not change these v1 constants for already-pending rows;
+  a future policy/contract change must persist a per-entry version or complete
+  immutable request before introducing new defaults.
+* A new job returns 201; identical replay returns 200 and the original job ID in
+  its **current state**, possibly already terminal. Iris validates nonblank ID,
+  task type, both payload references and attempt budget before acknowledging.
+  The adapter does not require a queued state. Other statuses are not acceptance.
+* Keys are globally unique within one Mercury database, not per credential,
+  worker, route, task type or Iris instance. Instances sharing Mercury must not
+  reuse a key for unrelated intent. Credential rotation does not change key scope.
+* Mercury compares task type, canonical payload JSON (object order/whitespace and
+  equivalent number spelling do not matter), and both presence and value of
+  `max_attempts` and `available_at`. Explicit availability is normalized to UTC.
+  Generated Mercury IDs/times and resolved omitted defaults are excluded.
+  A mismatch returns 409 and must be investigated using the original key.
+* The key and fingerprint live on the job row; the inspected code has no expiry
+  or cleanup operation. There is no independent permanent idempotency receipt or
+  published retention guarantee. **Safe crash recovery depends on retaining that
+  job/key for as long as Iris can replay pending intent.** Purging jobs, restoring
+  mismatched database backups, pointing Iris at a different Mercury database, or
+  changing task validation so old requests no longer replay breaks that guarantee.
+  These require a separate cross-service contract; this dispatcher cannot repair
+  them by retrying. Task validation currently runs before replay lookup.
+
+## Crash windows and retry boundaries
+
+`Dispatcher.dispatch` loads the run, checks the delivery relationship, calls the
+small `Submitter` interface, and uses `outbox.Repository.MarkSubmitted`. All
+repository calls use the caller-owned pool; there is no encompassing transaction
+and none is open during HTTP. The existing acknowledgment SQL preserves the first
+job ID/timestamp, accepts the same ID again and reports a different-ID conflict.
+
+If Mercury accepts but its response is lost, or Iris cannot persist the
+acknowledgment, intent stays recoverable. Every retry uses the stored key and the
+same v1 input. Concurrent dispatchers may both submit; Mercury's atomic unique-key
+create/replay produces one job and local acknowledgment converges on its ID. There
+are no claims, leases, database locks across HTTP, or alternate conflict keys.
+A crash after a committed local acknowledgment needs no further submission.
+Submitted means Mercury accepted the job, not that webhook delivery succeeded.
+
+`DispatchBatch` uses `ListPendingAfter` to take one bounded page ordered by
+creation time then run ID with C collation. It advances past failed entries and
+wraps after an empty page, so a bad first page cannot monopolize the oldest rows.
+New rows inserted behind the cursor are picked up on a later sweep. Cursor state
+is intentionally process-local; restarting safely restarts from the oldest pending
+intent. Continuous restarts can delay progress, so monitor repeated process exits.
+
+`Run` waits after every page and empty read. Consecutive failing pages double the
+wait up to the configured ceiling; successful/empty pages reset it. Each entry
+has a total operation deadline and each submission has an HTTP deadline. No
+application retry loop exists inside the HTTP adapter. Mercury, independently,
+owns delayed **webhook execution retries** and their attempt budget.
+
+Network errors, timeouts, HTTP 408/425/429 and 5xx are transient. HTTP 401/403,
+409, other rejected requests and malformed/mismatched acknowledgments have
+separate error categories. None acknowledges intent. Persistent failures remain
+pending, are revisited with bounded polling, and emit safe category messages.
+Operators must address configuration/conflicts rather than repeatedly restarting
+or changing keys. Request cancellation stops the loop. Arbitrary remote bodies,
+URLs, credentials, keys and raw database errors are excluded from command logs.
+
+The HTTP client disables redirects and environment proxies, bounds responses to
+8 MiB (including terminal-result projections on replay) and closes bodies. Configure an HTTPS origin without credentials, query,
+fragment or path prefix. HTTP is accepted only for localhost/127.0.0.1/::1 during
+local development. This is a trusted backend URL, independent of webhook SSRF
+policy and signing.
+
+## Limits
+
+| Environment variable | Default |
+| --- | --- |
+| `IRIS_DISPATCHER_BATCH_SIZE` | `100` (1–1000) |
+| `IRIS_DISPATCHER_POLL_INTERVAL` | `1s` |
+| `IRIS_DISPATCHER_MAX_BACKOFF` | `30s`, at least poll interval |
+| `IRIS_DISPATCHER_OPERATION_TIMEOUT` | `20s` per entry/read |
+| `IRIS_MERCURY_REQUEST_TIMEOUT` | `10s`, no greater than operation timeout |
+
+All durations must be positive. Request timeout bounds connection establishment,
+TLS and response reading; operation timeout also bounds relationship lookup and
+acknowledgment. Polling settings may change without changing request identity.
+
+## Manual verification
+
+Tests were added but **not run**, as requested. From the Iris repository:
+
+```sh
+go test ./...
+go test -race ./internal/application/dispatcher ./internal/mercury ./cmd/iris-dispatcher
+```
+
+For PostgreSQL checks, use an admin connection to a disposable development
+PostgreSQL cluster, with CREATE DATABASE permission:
+
+```sh
+IRIS_TEST_DATABASE_URL='postgres://USER:PASSWORD@127.0.0.1:5432/postgres?sslmode=disable' \
+  go test -count=1 ./internal/outbox/postgres
+```
+
+The existing fixture creates a randomly named database, applies real migrations,
+then drops only that database. It now also checks cursor pagination and C ordering;
+existing tests cover concurrent identical/conflicting acknowledgments. Without
+`IRIS_TEST_DATABASE_URL`, those checks skip explicitly. Unit tests cover submission,
+unchanged replay across fresh clients, lost responses, local acknowledgment failure,
+concurrent dispatchers, different job IDs, permanent/transient classifications,
+progress past a failing entry, deadlines and cancellation. HTTP fixtures simulate
+Mercury's verified protocol; they do not establish real-server support for the
+currently unregistered task or authenticate the current producer route.

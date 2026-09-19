@@ -124,6 +124,33 @@ func TestRepositoryIntegration(t *testing.T) {
 			}
 		}
 	})
+	t.Run("pending cursor progresses past failed first entry", func(t *testing.T) {
+		first, err := repo.ListPendingAfter(ctx, 1, time.Time{}, "")
+		if err != nil || len(first) != 1 || first[0].RunID() != "A" {
+			t.Fatalf("first page: %v %v", first, err)
+		}
+		second, err := repo.ListPendingAfter(ctx, 1, first[0].CreatedAt(), first[0].RunID())
+		if err != nil || len(second) != 1 || second[0].RunID() != "z" {
+			t.Fatalf("equal-time C ordering: %v %v", second, err)
+		}
+		third, err := repo.ListPendingAfter(ctx, 1, second[0].CreatedAt(), second[0].RunID())
+		if err != nil || len(third) != 1 || third[0].RunID() != "later" {
+			t.Fatalf("later page: %v %v", third, err)
+		}
+		end, err := repo.ListPendingAfter(ctx, 1, third[0].CreatedAt(), third[0].RunID())
+		if err != nil || len(end) != 0 {
+			t.Fatal("cursor did not reach end")
+		}
+		again, err := repo.ListPendingAfter(ctx, 1, time.Time{}, "")
+		if err != nil || len(again) != 1 || again[0].RunID() != "A" {
+			t.Fatal("unacknowledged intent lost")
+		}
+		for _, limit := range []int{0, -1, outboxpg.MaxPendingLimit + 1} {
+			if _, err := repo.ListPendingAfter(ctx, limit, time.Time{}, ""); err == nil {
+				t.Fatal("invalid page limit accepted")
+			}
+		}
+	})
 	t.Run("duplicates missing invalid", func(t *testing.T) {
 		for _, tt := range []struct {
 			e    outbox.Entry
