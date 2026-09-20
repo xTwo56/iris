@@ -2,7 +2,10 @@ module github.com/xTwo56/iris
 
 go 1.26.0
 
-require github.com/jackc/pgx/v5 v5.11.0
+require (
+	github.com/jackc/pgx/v5 v5.11.0
+	github.com/xtwo56/mercury v0.0.0-20260920225522-9253ed6b4571
+)
 
 require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
