@@ -1,4 +1,4 @@
-// Package api exposes authenticated event acceptance and routing management.
+// Package api exposes authenticated event acceptance, routing management and manual redelivery.
 package api
 
 import (
@@ -40,6 +40,7 @@ type EndpointCreator interface {
 // Dependencies supplies storage and application-generated metadata for testability.
 type Dependencies struct {
 	EventAcceptor   EventAcceptor
+	Redeliverer     Redeliverer
 	EndpointCreator EndpointCreator
 	Endpoints       Endpoints
 	Subscriptions   Subscriptions
@@ -55,11 +56,12 @@ func New(token string, d Dependencies) (http.Handler, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, errors.New("management token is required")
 	}
-	if d.EventAcceptor == nil || d.EndpointCreator == nil || d.Endpoints == nil || d.Subscriptions == nil || d.EndpointID == nil || d.SubscriptionID == nil || d.Now == nil {
+	if d.Redeliverer == nil || d.EventAcceptor == nil || d.EndpointCreator == nil || d.Endpoints == nil || d.Subscriptions == nil || d.EndpointID == nil || d.SubscriptionID == nil || d.Now == nil {
 		return nil, errors.New("missing API dependency")
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/events", d.acceptEvent)
+	mux.HandleFunc("POST /v1/deliveries/{id}/redeliver", d.redeliver)
 	mux.HandleFunc("POST /v1/endpoints", d.createEndpoint)
 	mux.HandleFunc("GET /v1/endpoints/{id}", d.getEndpoint)
 	mux.HandleFunc("PATCH /v1/endpoints/{id}", d.patchEndpoint)

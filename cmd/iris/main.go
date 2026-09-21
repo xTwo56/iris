@@ -18,6 +18,7 @@ import (
 	"github.com/xTwo56/iris/internal/api"
 	"github.com/xTwo56/iris/internal/application/acceptance"
 	"github.com/xTwo56/iris/internal/application/endpointcreation"
+	"github.com/xTwo56/iris/internal/application/redelivery"
 	"github.com/xTwo56/iris/internal/delivery"
 	"github.com/xTwo56/iris/internal/endpoint"
 	endpointpg "github.com/xTwo56/iris/internal/endpoint/postgres"
@@ -100,7 +101,9 @@ func run() error {
 		Delivery: func() (delivery.ID, error) { id, err := newID("del_"); return delivery.ID(id), err },
 		Run:      func() (delivery.RunID, error) { id, err := newID("run_"); return delivery.RunID(id), err },
 	}, func() time.Time { return time.Now().UTC().Truncate(time.Microsecond) })
-	handler, err := api.New(c.token, api.Dependencies{EventAcceptor: events, EndpointCreator: endpointcreation.New(pool, cipher), Endpoints: endpointpg.New(pool), Subscriptions: subscriptionpg.New(pool), EndpointID: func() (endpoint.ID, error) { id, err := newID("ep_"); return endpoint.ID(id), err }, SubscriptionID: func() (subscription.ID, error) { id, err := newID("sub_"); return subscription.ID(id), err }, Now: time.Now})
+	// Manual redelivery borrows the same pool, but owns its own short transaction.
+	redeliveries := redelivery.New(pool, func() (delivery.RunID, error) { id, err := newID("run_"); return delivery.RunID(id), err }, func() time.Time { return time.Now().UTC().Truncate(time.Microsecond) })
+	handler, err := api.New(c.token, api.Dependencies{EventAcceptor: events, Redeliverer: redeliveries, EndpointCreator: endpointcreation.New(pool, cipher), Endpoints: endpointpg.New(pool), Subscriptions: subscriptionpg.New(pool), EndpointID: func() (endpoint.ID, error) { id, err := newID("ep_"); return endpoint.ID(id), err }, SubscriptionID: func() (subscription.ID, error) { id, err := newID("sub_"); return subscription.ID(id), err }, Now: time.Now})
 	if err != nil {
 		return errors.New("API configuration failed")
 	}

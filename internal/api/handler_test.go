@@ -6,6 +6,8 @@ import (
 	"errors"
 	"github.com/xTwo56/iris/internal/api"
 	"github.com/xTwo56/iris/internal/application/acceptance"
+	"github.com/xTwo56/iris/internal/application/redelivery"
+	"github.com/xTwo56/iris/internal/delivery"
 	"github.com/xTwo56/iris/internal/endpoint"
 	endpointpg "github.com/xTwo56/iris/internal/endpoint/postgres"
 	"github.com/xTwo56/iris/internal/event"
@@ -96,8 +98,15 @@ func setup(t *testing.T) (http.Handler, *endpoints, *subscriptions) {
 
 func setupWithAcceptor(t *testing.T, acceptor api.EventAcceptor) (http.Handler, *endpoints, *subscriptions) {
 	t.Helper()
+	return setupWithServices(t, acceptor, redeliverFunc(func(context.Context, string, delivery.ID) (redelivery.Result, error) {
+		t.Fatal("unexpected redelivery")
+		return redelivery.Result{}, nil
+	}))
+}
+func setupWithServices(t *testing.T, acceptor api.EventAcceptor, redeliverer api.Redeliverer) (http.Handler, *endpoints, *subscriptions) {
+	t.Helper()
 	e, s := &endpoints{}, &subscriptions{}
-	h, err := api.New("secret", api.Dependencies{EventAcceptor: acceptor, EndpointCreator: e, Endpoints: e, Subscriptions: s, EndpointID: func() (endpoint.ID, error) { return "ep", nil }, SubscriptionID: func() (subscription.ID, error) { return "sub", nil }, Now: func() time.Time { return time.Date(2026, 9, 19, 0, 0, 0, 123456789, time.UTC) }})
+	h, err := api.New("secret", api.Dependencies{EventAcceptor: acceptor, Redeliverer: redeliverer, EndpointCreator: e, Endpoints: e, Subscriptions: s, EndpointID: func() (endpoint.ID, error) { return "ep", nil }, SubscriptionID: func() (subscription.ID, error) { return "sub", nil }, Now: func() time.Time { return time.Date(2026, 9, 19, 0, 0, 0, 123456789, time.UTC) }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +123,7 @@ func request(h http.Handler, method, path, body, auth string) *httptest.Response
 }
 func TestAuthentication(t *testing.T) {
 	h, _, _ := setup(t)
-	for _, route := range []struct{ m, p string }{{"POST", "/v1/events"}, {"POST", "/v1/endpoints"}, {"GET", "/v1/endpoints/ep"}, {"PATCH", "/v1/endpoints/ep"}, {"POST", "/v1/subscriptions"}, {"GET", "/v1/subscriptions/sub"}, {"PATCH", "/v1/subscriptions/sub"}} {
+	for _, route := range []struct{ m, p string }{{"POST", "/v1/deliveries/d/redeliver"}, {"POST", "/v1/events"}, {"POST", "/v1/endpoints"}, {"GET", "/v1/endpoints/ep"}, {"PATCH", "/v1/endpoints/ep"}, {"POST", "/v1/subscriptions"}, {"GET", "/v1/subscriptions/sub"}, {"PATCH", "/v1/subscriptions/sub"}} {
 		for _, auth := range []string{"", "Bearer wrong", "Basic secret"} {
 			w := request(h, route.m, route.p, `{}`, auth)
 			if w.Code != 401 || w.Header().Get("WWW-Authenticate") == "" || strings.Contains(w.Body.String(), "secret") {
