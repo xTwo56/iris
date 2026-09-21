@@ -119,7 +119,7 @@ func TestSubmissionIntegration(t *testing.T) {
 	t.Run("replay conflicts and routing changes", func(t *testing.T) {
 		e := makeEvent("first", "type", at, " {\"n\":1.00} ")
 		result, err := svc.Accept(ctx, "key", e)
-		if err != nil || result.DeliveryCount != 1 {
+		if err != nil || result.DeliveryCount != 1 || result.Replayed {
 			t.Fatalf("%+v %v", result, err)
 		}
 		before := counts()
@@ -131,12 +131,12 @@ func TestSubmissionIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		replay, err := svc.Accept(ctx, "key", e)
-		if err != nil || replay != result {
+		if err != nil || replay != replayResult(result) {
 			t.Fatalf("%+v %v", replay, err)
 		}
 		// Same instant in another timezone remains equivalent.
 		zoned := makeEvent(e.ID(), e.Type(), at.In(time.FixedZone("other", 19800)), string(e.Payload()))
-		if got, err := svc.Accept(ctx, "key", zoned); err != nil || got != result {
+		if got, err := svc.Accept(ctx, "key", zoned); err != nil || got != replayResult(result) {
 			t.Fatalf("zone equivalence: %+v %v", got, err)
 		}
 		for _, different := range []event.Event{
@@ -171,7 +171,7 @@ func TestSubmissionIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 		b, err := svc.Accept(ctx, "zero-key", e)
-		if err != nil || a != b {
+		if err != nil || replayResult(a) != b {
 			t.Fatalf("%+v %v", b, err)
 		}
 		if _, err := svc.Accept(ctx, " \t", e); err == nil {
@@ -226,7 +226,7 @@ func TestSubmissionIntegration(t *testing.T) {
 				if !errors.Is(b.err, acceptance.ErrSubmissionConflict) {
 					t.Fatalf("conflict: %v", b.err)
 				}
-			} else if b.err != nil || a.result != b.result {
+			} else if b.err != nil || replayResult(a.result) != b.result {
 				t.Fatalf("replay: %+v %v", b.result, b.err)
 			}
 			var n int
@@ -247,4 +247,10 @@ func TestSubmissionIntegration(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+// Replay metadata describes the call; the original acceptance fields stay equal.
+func replayResult(r acceptance.Result) acceptance.Result {
+	r.Replayed = true
+	return r
 }

@@ -31,6 +31,9 @@ type IDs struct {
 type Result struct {
 	EventID       event.ID
 	DeliveryCount int
+	// Replayed describes this invocation, not the stored acceptance result. It
+	// lets callers distinguish a committed replay without a second lookup.
+	Replayed bool
 }
 
 type Service struct {
@@ -76,6 +79,7 @@ func (s *Service) Accept(ctx context.Context, key string, e event.Event) (result
 		if err := tx.Commit(ctx); err != nil {
 			return Result{}, fmt.Errorf("accept event replay: commit: %w", err)
 		}
+		replay.Replayed = true
 		return *replay, nil
 	}
 	if err := eventpg.New(tx).Create(ctx, e); err != nil {

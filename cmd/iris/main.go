@@ -1,4 +1,4 @@
-// Command iris runs the single-service management API. Migrations are applied separately.
+// Command iris runs the authenticated Iris API. Migrations are applied separately.
 package main
 
 import (
@@ -16,7 +16,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/xTwo56/iris/internal/api"
+	"github.com/xTwo56/iris/internal/application/acceptance"
 	"github.com/xTwo56/iris/internal/application/endpointcreation"
+	"github.com/xTwo56/iris/internal/delivery"
 	"github.com/xTwo56/iris/internal/endpoint"
 	endpointpg "github.com/xTwo56/iris/internal/endpoint/postgres"
 	"github.com/xTwo56/iris/internal/endpointsecret"
@@ -92,7 +94,13 @@ func run() error {
 	if err != nil {
 		return errors.New("secret encryption configuration failed")
 	}
-	handler, err := api.New(c.token, api.Dependencies{EndpointCreator: endpointcreation.New(pool, cipher), Endpoints: endpointpg.New(pool), Subscriptions: subscriptionpg.New(pool), EndpointID: func() (endpoint.ID, error) { id, err := newID("ep_"); return endpoint.ID(id), err }, SubscriptionID: func() (subscription.ID, error) { id, err := newID("sub_"); return subscription.ID(id), err }, Now: time.Now})
+	// Acceptance borrows this pool and owns one transaction per submission. Only
+	// delivery/run identities are generated here; producer event fields pass through.
+	events := acceptance.New(pool, acceptance.IDs{
+		Delivery: func() (delivery.ID, error) { id, err := newID("del_"); return delivery.ID(id), err },
+		Run:      func() (delivery.RunID, error) { id, err := newID("run_"); return delivery.RunID(id), err },
+	}, func() time.Time { return time.Now().UTC().Truncate(time.Microsecond) })
+	handler, err := api.New(c.token, api.Dependencies{EventAcceptor: events, EndpointCreator: endpointcreation.New(pool, cipher), Endpoints: endpointpg.New(pool), Subscriptions: subscriptionpg.New(pool), EndpointID: func() (endpoint.ID, error) { id, err := newID("ep_"); return endpoint.ID(id), err }, SubscriptionID: func() (subscription.ID, error) { id, err := newID("sub_"); return subscription.ID(id), err }, Now: time.Now})
 	if err != nil {
 		return errors.New("API configuration failed")
 	}
