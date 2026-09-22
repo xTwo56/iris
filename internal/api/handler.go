@@ -41,6 +41,7 @@ type EndpointCreator interface {
 type Dependencies struct {
 	EventAcceptor   EventAcceptor
 	Redeliverer     Redeliverer
+	History         History
 	EndpointCreator EndpointCreator
 	Endpoints       Endpoints
 	Subscriptions   Subscriptions
@@ -56,11 +57,15 @@ func New(token string, d Dependencies) (http.Handler, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, errors.New("management token is required")
 	}
-	if d.Redeliverer == nil || d.EventAcceptor == nil || d.EndpointCreator == nil || d.Endpoints == nil || d.Subscriptions == nil || d.EndpointID == nil || d.SubscriptionID == nil || d.Now == nil {
+	if d.History == nil || d.Redeliverer == nil || d.EventAcceptor == nil || d.EndpointCreator == nil || d.Endpoints == nil || d.Subscriptions == nil || d.EndpointID == nil || d.SubscriptionID == nil || d.Now == nil {
 		return nil, errors.New("missing API dependency")
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/events", d.acceptEvent)
+	mux.HandleFunc("GET /v1/events/{id}/deliveries", d.listDeliveries)
+	mux.HandleFunc("GET /v1/deliveries/{id}", d.getDelivery)
+	mux.HandleFunc("GET /v1/deliveries/{id}/runs", d.listRuns)
+	mux.HandleFunc("GET /v1/runs/{id}/attempts", d.listAttempts)
 	mux.HandleFunc("POST /v1/deliveries/{id}/redeliver", d.redeliver)
 	mux.HandleFunc("POST /v1/endpoints", d.createEndpoint)
 	mux.HandleFunc("GET /v1/endpoints/{id}", d.getEndpoint)
