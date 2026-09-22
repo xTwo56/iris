@@ -220,12 +220,44 @@ func TestTerminalRepositoryIntegration(t *testing.T) {
 			}
 		}
 		must(repo.Record(ctx, value("wrong", delivery.TerminalFailed, at)))
-		for _, sql := range []string{`DELETE FROM outbox WHERE run_id='A'`, `DELETE FROM delivery_runs WHERE id='A'`, `UPDATE outbox SET mercury_job_id='other' WHERE run_id='A'`} {
-			_, err := pool.Exec(ctx, sql)
+		for _, tt := range []struct {
+			name         string
+			sql          string
+			constraint   string
+			deleteAction bool
+		}{
+			{"delete acknowledged outbox", `DELETE FROM outbox WHERE run_id='A'`, "run_terminals_outbox_job_fk", true},
+			{"delete run with pending outbox", `DELETE FROM delivery_runs WHERE id='pending'`, "outbox_run_fk", true},
+			{"change acknowledged job identity", `UPDATE outbox SET mercury_job_id='other' WHERE run_id='A'`, "run_terminals_outbox_job_fk", false},
+		} {
+			_, err := pool.Exec(ctx, tt.sql)
 			var pe *pgconn.PgError
-			if !errors.As(err, &pe) || pe.Code != "23503" {
-				t.Fatalf("restrictive relationship: %v", err)
+			if !errors.As(err, &pe) || pe.ConstraintName != tt.constraint {
+				t.Fatalf("%s: got %v, want constraint %s", tt.name, err, tt.constraint)
 			}
+			// PostgreSQL 18 reports ON DELETE RESTRICT as restrict_violation;
+			// earlier supported releases may report foreign_key_violation instead.
+			validCode := pe.Code == "23503" || tt.deleteAction && pe.Code == "23001"
+			if !validCode {
+				t.Fatalf("%s: got SQLSTATE %s, want 23503 or delete-specific 23001", tt.name, pe.Code)
+			}
+		}
+		var completeHistory, pendingRelationship int
+		must(pool.QueryRow(ctx, `
+			SELECT count(*)
+			FROM delivery_runs r
+			JOIN outbox o ON o.run_id = r.id
+			JOIN run_terminals t ON t.run_id = r.id AND t.mercury_job_id = o.mercury_job_id
+			WHERE r.id = 'A' AND o.mercury_job_id = 'job-A'
+		`).Scan(&completeHistory))
+		must(pool.QueryRow(ctx, `
+			SELECT count(*)
+			FROM delivery_runs r
+			JOIN outbox o ON o.run_id = r.id
+			WHERE r.id = 'pending'
+		`).Scan(&pendingRelationship))
+		if completeHistory != 1 || pendingRelationship != 1 {
+			t.Fatalf("restricted writes changed parent/history rows: complete=%d pending=%d", completeHistory, pendingRelationship)
 		}
 	})
 

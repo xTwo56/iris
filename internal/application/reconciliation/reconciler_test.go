@@ -124,6 +124,41 @@ func TestConfirmedStatesOnly(t *testing.T) {
 	}
 }
 
+func TestRetryThenSuccessPreservesFirstObservation(t *testing.T) {
+	m := storeFor(t, "run")
+	failedAt := testTime
+	job := jobFor("run", workerclient.StateRetryScheduled)
+	job.FailedAt = &failedAt
+	r := newTestReconciler(t, m, inspectFunc(func(context.Context, workerclient.JobID) (workerclient.Job, error) {
+		return job, nil
+	}), 1)
+	entry := m.entries[0]
+	if err := r.reconcile(context.Background(), entry); err != nil || len(m.saved) != 0 {
+		t.Fatalf("retry scheduled must remain unresolved: err=%v records=%d", err, len(m.saved))
+	}
+	job = jobFor("run", workerclient.StateSucceeded)
+	job.FailedAt = &failedAt
+	if err := r.reconcile(context.Background(), entry); err != nil {
+		t.Fatalf("success with historical failure: %v", err)
+	}
+	first, ok := m.saved[entry.Run.ID()]
+	if !ok || first.State() != delivery.TerminalSucceeded || first.MercuryJobID() != entry.MercuryJobID || !first.ObservedAt().Equal(testTime.Add(time.Hour)) {
+		t.Fatalf("incorrect terminal observation: %+v", first)
+	}
+	// Another reconciler may already hold this entry when the first record lands.
+	// Reinspect that stale selection with a later clock; the first record must win.
+	r.now = func() time.Time { return testTime.Add(2 * time.Hour) }
+	if err := r.reconcile(context.Background(), entry); err != nil {
+		t.Fatalf("repeated success observation: %v", err)
+	}
+	if len(m.saved) != 1 || m.saved[entry.Run.ID()] != first {
+		t.Fatal("repeated observation changed terminal history")
+	}
+	if job.FailedAt == nil || !job.FailedAt.Equal(failedAt) {
+		t.Fatal("reconciliation erased Mercury failure history")
+	}
+}
+
 func TestInspectionProblemsNeverBecomeFailure(t *testing.T) {
 	for _, tt := range []struct {
 		name      string
@@ -142,7 +177,9 @@ func TestInspectionProblemsNeverBecomeFailure(t *testing.T) {
 		{"missing payload", func(j *workerclient.Job) { j.Payload = nil }, nil, ErrProtocol},
 		{"unknown state", func(j *workerclient.Job) { j.State = "completed" }, nil, ErrProtocol},
 		{"missing completion", func(j *workerclient.Job) { j.CompletedAt = nil }, nil, ErrProtocol},
-		{"contradictory terminal dates", func(j *workerclient.Job) { j.FailedAt = j.CompletedAt }, nil, ErrProtocol},
+		{"zero completion", func(j *workerclient.Job) { j.CompletedAt = new(time.Time) }, nil, ErrProtocol},
+		{"failed state with completion", func(j *workerclient.Job) { j.State = workerclient.StateFailed; j.FailedAt = j.CompletedAt }, nil, ErrProtocol},
+		{"failed state without failure time", func(j *workerclient.Job) { j.State = workerclient.StateFailed; j.CompletedAt = nil }, nil, ErrProtocol},
 		{"terminal lease", func(j *workerclient.Job) { j.Lease = &workerclient.Lease{} }, nil, ErrProtocol},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

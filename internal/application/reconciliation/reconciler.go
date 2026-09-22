@@ -135,7 +135,9 @@ func (r *Reconciler) reconcile(ctx context.Context, entry delivery.SubmittedRun)
 	case workerclient.StateQueued, workerclient.StateLeased, workerclient.StateRunning, workerclient.StateRetryScheduled:
 		return nil
 	case workerclient.StateSucceeded:
-		if job.CompletedAt == nil || job.CompletedAt.IsZero() || job.FailedAt != nil || job.Lease != nil {
+		// A retry can succeed after an earlier failure. Mercury retains FailedAt
+		// from that attempt; the confirmed terminal state determines this result.
+		if job.CompletedAt == nil || job.CompletedAt.IsZero() || job.Lease != nil {
 			return ErrProtocol
 		}
 		state = delivery.TerminalSucceeded
